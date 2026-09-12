@@ -496,7 +496,7 @@ st.sidebar.header("⚙️ Project Inputs")
 
 project_name = st.sidebar.text_input(
     "Project Name",
-    value="Dam Water Availability Study"
+    value="Enter Name of Project"
 )
 
 latitude = st.sidebar.number_input(
