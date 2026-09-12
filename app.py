@@ -1416,6 +1416,5 @@ else:
 st.markdown("---")
 
 st.caption(
-    "Dam Water Availability AI Assistant | "
     "Developed by THE FLOW CODER💯"
 )
