@@ -3,13 +3,12 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
-
 from groq import Groq
 
 
-# =========================================================
+# ============================================================
 # PAGE CONFIGURATION
-# =========================================================
+# ============================================================
 
 st.set_page_config(
     page_title="Dam Water Availability AI",
@@ -18,28 +17,62 @@ st.set_page_config(
 )
 
 
-# =========================================================
+# ============================================================
+# APPLICATION TITLE
+# ============================================================
+
+st.title("💧 Dam Water Availability AI")
+st.subheader("AI-Assisted Rainfall–Runoff Assessment for Dam Sites")
+
+st.markdown(
+    """
+This application estimates **direct runoff and water availability**
+for a proposed dam site using daily rainfall data from NASA POWER
+and the **SCS Curve Number (SCS-CN)** method.
+
+The application also uses Generative AI to provide hydrological
+interpretation and answer technical questions.
+"""
+)
+
+
+# ============================================================
 # GROQ CONFIGURATION
-# =========================================================
+# ============================================================
 
-GROQ_MODEL = "openai/gpt-oss-20b"
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", None)
+    GROQ_MODEL = "openai/gpt-oss-20b"
 
-if GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-else:
+    groq_client = Groq(
+        api_key=GROQ_API_KEY
+    )
+
+except Exception:
+    GROQ_API_KEY = None
+    GROQ_MODEL = "openai/gpt-oss-20b"
     groq_client = None
 
 
-# =========================================================
-# FUNCTIONS
-# =========================================================
+# ============================================================
+# NASA POWER DAILY RAINFALL FUNCTION
+# ============================================================
 
-def get_daily_rainfall(latitude, longitude, start_date, end_date):
+def get_daily_rainfall(
+    latitude,
+    longitude,
+    start_date,
+    end_date
+):
 
-    start_str = pd.to_datetime(start_date).strftime("%Y%m%d")
-    end_str = pd.to_datetime(end_date).strftime("%Y%m%d")
+    start_str = pd.to_datetime(
+        start_date
+    ).strftime("%Y%m%d")
+
+    end_str = pd.to_datetime(
+        end_date
+    ).strftime("%Y%m%d")
 
     url = (
         "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -52,12 +85,17 @@ def get_daily_rainfall(latitude, longitude, start_date, end_date):
         f"&format=JSON"
     )
 
-    response = requests.get(url, timeout=60)
+    response = requests.get(
+        url,
+        timeout=60
+    )
 
     if response.status_code != 200:
+
         raise Exception(
             f"NASA POWER API error: "
-            f"{response.status_code}"
+            f"{response.status_code} - "
+            f"{response.text[:500]}"
         )
 
     data = response.json()
@@ -68,24 +106,35 @@ def get_daily_rainfall(latitude, longitude, start_date, end_date):
         ["PRECTOTCORR"]
     )
 
-    df = pd.DataFrame(
+    rainfall_df = pd.DataFrame(
         list(rainfall_data.items()),
-        columns=["Date", "Rainfall_mm"]
+        columns=[
+            "Date",
+            "Rainfall_mm"
+        ]
     )
 
-    df["Date"] = pd.to_datetime(df["Date"])
+    rainfall_df["Date"] = pd.to_datetime(
+        rainfall_df["Date"]
+    )
 
-    df["Rainfall_mm"] = pd.to_numeric(
-        df["Rainfall_mm"],
+    rainfall_df["Rainfall_mm"] = pd.to_numeric(
+        rainfall_df["Rainfall_mm"],
         errors="coerce"
     )
 
-    df = df.dropna()
+    rainfall_df = rainfall_df.dropna()
 
-    df = df.sort_values("Date").reset_index(drop=True)
+    rainfall_df = rainfall_df.sort_values(
+        "Date"
+    ).reset_index(drop=True)
 
-    return df
+    return rainfall_df
 
+
+# ============================================================
+# SCS CURVE NUMBER RUNOFF CALCULATION
+# ============================================================
 
 def calculate_scs_cn(
     rainfall_df,
@@ -96,31 +145,53 @@ def calculate_scs_cn(
     CN = float(curve_number)
 
     if CN <= 0 or CN >= 100:
+
         raise ValueError(
             "Curve Number must be between 0 and 100."
         )
 
+    if catchment_area_km2 <= 0:
+
+        raise ValueError(
+            "Catchment area must be greater than zero."
+        )
+
+    # SCS Curve Number storage parameter
     S = (25400 / CN) - 254
 
+    # Initial abstraction
     Ia = 0.2 * S
 
     df = rainfall_df.copy()
 
+    # --------------------------------------------------------
+    # SCS-CN DIRECT RUNOFF
+    # --------------------------------------------------------
+
     def calculate_runoff(P):
 
         if P <= Ia:
+
             return 0.0
 
-        return (
-            (P - Ia) ** 2
-        ) / (
-            P - Ia + S
-        )
+        else:
+
+            return (
+                (P - Ia) ** 2
+                /
+                (P - Ia + S)
+            )
 
     df["Runoff_mm"] = (
         df["Rainfall_mm"]
         .apply(calculate_runoff)
     )
+
+    # --------------------------------------------------------
+    # RUNOFF VOLUME
+    # --------------------------------------------------------
+
+    # 1 mm rainfall over 1 km² = 1,000 m³
 
     df["Runoff_m3"] = (
         df["Runoff_mm"]
@@ -128,38 +199,88 @@ def calculate_scs_cn(
         * 1000
     )
 
+    # --------------------------------------------------------
+    # MILLION CUBIC METRES
+    # --------------------------------------------------------
+
     df["Runoff_MCM"] = (
-        df["Runoff_m3"] / 1_000_000
+        df["Runoff_m3"]
+        / 1_000_000
+    )
+
+    # --------------------------------------------------------
+    # ACRE-FEET
+    # --------------------------------------------------------
+
+    # 1 acre-foot = 1,233.48184 m³
+
+    df["Runoff_AcreFeet"] = (
+        df["Runoff_m3"]
+        / 1233.48184
     )
 
     return df, S, Ia
 
 
+# ============================================================
+# ANNUAL STATISTICS
+# ============================================================
+
 def calculate_annual_statistics(df):
 
     df = df.copy()
 
-    df["Year"] = df["Date"].dt.year
+    df["Year"] = (
+        df["Date"]
+        .dt.year
+    )
 
     annual = (
         df.groupby("Year")
         .agg(
-            Rainfall_mm=("Rainfall_mm", "sum"),
-            Runoff_mm=("Runoff_mm", "sum"),
-            Runoff_MCM=("Runoff_MCM", "sum")
+            Rainfall_mm=(
+                "Rainfall_mm",
+                "sum"
+            ),
+
+            Runoff_mm=(
+                "Runoff_mm",
+                "sum"
+            ),
+
+            Runoff_MCM=(
+                "Runoff_MCM",
+                "sum"
+            ),
+
+            Runoff_AcreFeet=(
+                "Runoff_AcreFeet",
+                "sum"
+            )
         )
         .reset_index()
     )
 
+    # --------------------------------------------------------
+    # RUNOFF COEFFICIENT
+    # --------------------------------------------------------
+
     annual["Runoff_Coefficient"] = np.where(
         annual["Rainfall_mm"] > 0,
+
         annual["Runoff_mm"]
-        / annual["Rainfall_mm"],
+        /
+        annual["Rainfall_mm"],
+
         0
     )
 
     return annual
 
+
+# ============================================================
+# AI HYDROLOGICAL INTERPRETATION
+# ============================================================
 
 def generate_ai_interpretation(
     project_name,
@@ -170,32 +291,38 @@ def generate_ai_interpretation(
     start_date,
     end_date,
     annual_results,
-    total_runoff_mcm
+    total_runoff_mcm,
+    total_runoff_acre_feet
 ):
 
     if groq_client is None:
+
         return (
             "Groq API key is not configured. "
-            "Please add GROQ_API_KEY to Streamlit Secrets."
+            "Please add GROQ_API_KEY in Streamlit Secrets."
         )
 
     prompt = f"""
-You are an expert hydrologist specializing in rainfall-runoff
-modelling and dam water availability.
+
+You are an expert hydrologist specializing in:
+
+- rainfall-runoff modelling
+- water resources engineering
+- dam water availability
+- SCS Curve Number methodology
+- hydrological data analysis
 
 Project Name:
 {project_name}
 
-Latitude:
-{latitude}
-
-Longitude:
-{longitude}
+Project Location:
+Latitude = {latitude}
+Longitude = {longitude}
 
 Catchment Area:
 {catchment_area_km2} km²
 
-Curve Number:
+SCS Curve Number:
 {curve_number}
 
 Analysis Period:
@@ -204,117 +331,183 @@ Analysis Period:
 Total Estimated Direct Runoff:
 {total_runoff_mcm:.3f} MCM
 
+Total Estimated Direct Runoff:
+{total_runoff_acre_feet:.2f} Acre-feet
+
 Annual Results:
 {annual_results.to_string(index=False)}
 
-Provide a professional hydrological interpretation covering:
+Provide a professional hydrological interpretation.
+
+Discuss:
 
 1. Rainfall characteristics
-2. Runoff response
+2. Estimated runoff response
 3. Year-to-year variation
-4. Rainfall-runoff relationship
-5. Significance for dam water availability
-6. Limitations of the SCS-CN approach
+4. Relationship between rainfall and runoff
+5. Hydrological significance for dam water availability
+6. Effect of the selected Curve Number
+7. Important limitations of the SCS Curve Number approach
 
-Do not invent data.
+Important technical instructions:
 
-Clearly explain that SCS-CN estimates direct runoff and does not
-represent final reservoir yield. Mention that reservoir routing,
-evaporation, seepage, transmission losses, environmental flows,
-abstractions and operating rules may need to be considered.
+- Do not invent missing information.
+- Clearly state that SCS-CN estimates direct runoff.
+- Do not claim that calculated runoff is the final dependable
+  reservoir yield.
+- Explain that evaporation, seepage, transmission losses,
+  environmental flows, abstractions, reservoir storage,
+  reservoir routing and operating rules may need to be considered
+  for a detailed water availability assessment.
+- Keep the language professional and suitable for an engineering
+  report.
 """
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert hydrologist "
-                    "and water resources engineer."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.3,
-        max_tokens=1000
-    )
+    try:
 
-    return response.choices[0].message.content
+        response = groq_client.chat.completions.create(
+
+            model=GROQ_MODEL,
+
+            messages=[
+
+                {
+                    "role": "system",
+                    "content":
+                    """
+                    You are an expert hydrologist and water
+                    resources engineer. Provide technically sound,
+                    practical and professional hydrological
+                    interpretations.
+                    """
+                },
+
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            temperature=0.3,
+
+            max_tokens=1200
+        )
+
+        return (
+            response
+            .choices[0]
+            .message
+            .content
+        )
+
+    except Exception as e:
+
+        return (
+            f"AI interpretation error: {str(e)}"
+        )
 
 
-def ask_ai_chatbot(question, project_context):
+# ============================================================
+# AI CHATBOT
+# ============================================================
+
+def ask_ai_chatbot(
+    question,
+    project_context
+):
 
     if groq_client is None:
+
         return (
             "Groq API key is not configured. "
-            "Please add GROQ_API_KEY to Streamlit Secrets."
+            "Please add GROQ_API_KEY in Streamlit Secrets."
         )
 
     prompt = f"""
+
 You are an AI hydrology assistant.
 
-Project information:
+You are helping a civil engineer/hydrologist analyze
+a dam water availability assessment.
+
+PROJECT INFORMATION:
 
 {project_context}
 
-User question:
+USER QUESTION:
 
 {question}
 
-Answer using sound hydrological and water-resources
-engineering principles.
+Provide a technically sound answer using principles of:
 
-Do not invent missing information.
+- hydrology
+- rainfall-runoff modelling
+- SCS Curve Number
+- water resources engineering
+- dam water availability
+
+Important:
+
+- Do not invent data.
+- Clearly state assumptions.
+- If the available information is insufficient,
+  say so.
+- Keep the answer practical and understandable.
 """
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert hydrologist specializing "
-                    "in rainfall-runoff modelling and dam "
-                    "water availability."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.3,
-        max_tokens=700
-    )
+    try:
 
-    return response.choices[0].message.content
+        response = groq_client.chat.completions.create(
+
+            model=GROQ_MODEL,
+
+            messages=[
+
+                {
+                    "role": "system",
+                    "content":
+                    """
+                    You are an expert hydrologist specializing
+                    in rainfall-runoff modelling, SCS-CN,
+                    dam water availability and water resources
+                    engineering.
+                    """
+                },
+
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+
+            temperature=0.3,
+
+            max_tokens=800
+        )
+
+        return (
+            response
+            .choices[0]
+            .message
+            .content
+        )
+
+    except Exception as e:
+
+        return (
+            f"Chatbot error: {str(e)}"
+        )
 
 
-# =========================================================
-# USER INTERFACE
-# =========================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
-st.title("💧 Dam Water Availability AI")
-
-st.write(
-    "Estimate rainfall-runoff and potential direct runoff "
-    "using NASA POWER rainfall data and the SCS Curve Number method."
-)
-
-
-# =========================================================
-# INPUTS
-# =========================================================
-
-st.sidebar.header("Project Information")
+st.sidebar.header("⚙️ Project Inputs")
 
 project_name = st.sidebar.text_input(
     "Project Name",
-    value="Example Dam Project"
+    value="Dam Water Availability Study"
 )
 
 latitude = st.sidebar.number_input(
@@ -331,222 +524,510 @@ longitude = st.sidebar.number_input(
 
 catchment_area_km2 = st.sidebar.number_input(
     "Catchment Area (km²)",
-    min_value=0.1,
-    value=250.0
+    min_value=0.01,
+    value=100.0,
+    step=1.0
 )
 
 curve_number = st.sidebar.number_input(
     "SCS Curve Number",
     min_value=1.0,
     max_value=99.0,
-    value=72.0
+    value=72.0,
+    step=1.0
+)
+
+st.sidebar.subheader(
+    "Rainfall Analysis Period"
 )
 
 start_date = st.sidebar.date_input(
-    "Analysis Start Date",
-    value=pd.Timestamp("2000-01-01")
+    "Start Date",
+    value=pd.Timestamp(
+        "2000-01-01"
+    )
 )
 
 end_date = st.sidebar.date_input(
-    "Analysis End Date",
-    value=pd.Timestamp("2020-12-31")
+    "End Date",
+    value=pd.Timestamp(
+        "2025-12-31"
+    )
 )
 
 
-# =========================================================
-# CALCULATE
-# =========================================================
+# ============================================================
+# CALCULATE BUTTON
+# ============================================================
 
-if st.sidebar.button(
-    "Calculate Water Availability",
-    type="primary"
-):
+calculate_button = st.sidebar.button(
+    "🚀 Calculate Water Availability",
+    use_container_width=True
+)
+
+
+# ============================================================
+# MAIN CALCULATION
+# ============================================================
+
+if calculate_button:
+
+    # --------------------------------------------------------
+    # VALIDATE DATES
+    # --------------------------------------------------------
 
     if start_date >= end_date:
 
         st.error(
-            "End date must be later than start date."
+            "Start date must be earlier than end date."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # VALIDATE COORDINATES
+    # --------------------------------------------------------
+
+    if latitude < -90 or latitude > 90:
+
+        st.error(
+            "Latitude must be between -90 and 90 degrees."
+        )
+
+        st.stop()
+
+    if longitude < -180 or longitude > 180:
+
+        st.error(
+            "Longitude must be between -180 and 180 degrees."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # DOWNLOAD RAINFALL
+    # --------------------------------------------------------
+
+    with st.spinner(
+        "Retrieving daily rainfall from NASA POWER..."
+    ):
+
+        try:
+
+            rainfall_df = get_daily_rainfall(
+                latitude,
+                longitude,
+                start_date,
+                end_date
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Rainfall data retrieval failed: {e}"
+            )
+
+            st.stop()
+
+    if rainfall_df.empty:
+
+        st.error(
+            "No rainfall data were returned for "
+            "the selected period."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # SCS-CN CALCULATION
+    # --------------------------------------------------------
+
+    with st.spinner(
+        "Calculating SCS-CN direct runoff..."
+    ):
+
+        try:
+
+            runoff_df, S, Ia = calculate_scs_cn(
+
+                rainfall_df,
+
+                curve_number,
+
+                catchment_area_km2
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Runoff calculation failed: {e}"
+            )
+
+            st.stop()
+
+    # --------------------------------------------------------
+    # ANNUAL STATISTICS
+    # --------------------------------------------------------
+
+    annual = calculate_annual_statistics(
+        runoff_df
+    )
+
+    # --------------------------------------------------------
+    # TOTAL RESULTS
+    # --------------------------------------------------------
+
+    total_rainfall_mm = (
+        runoff_df["Rainfall_mm"]
+        .sum()
+    )
+
+    total_runoff_mm = (
+        runoff_df["Runoff_mm"]
+        .sum()
+    )
+
+    total_runoff_m3 = (
+        runoff_df["Runoff_m3"]
+        .sum()
+    )
+
+    total_runoff_mcm = (
+        runoff_df["Runoff_MCM"]
+        .sum()
+    )
+
+    total_runoff_acre_feet = (
+        runoff_df["Runoff_AcreFeet"]
+        .sum()
+    )
+
+    # --------------------------------------------------------
+    # RUNOFF COEFFICIENT
+    # --------------------------------------------------------
+
+    if total_rainfall_mm > 0:
+
+        overall_runoff_coefficient = (
+            total_runoff_mm
+            /
+            total_rainfall_mm
         )
 
     else:
 
-        with st.spinner(
-            "Downloading rainfall and calculating runoff..."
-        ):
+        overall_runoff_coefficient = 0
 
-            try:
+    # --------------------------------------------------------
+    # SAVE DATA TO SESSION STATE
+    # --------------------------------------------------------
 
-                rainfall_df = get_daily_rainfall(
-                    latitude,
-                    longitude,
-                    start_date,
-                    end_date
-                )
+    st.session_state["runoff_df"] = runoff_df
 
-                runoff_df, S, Ia = calculate_scs_cn(
-                    rainfall_df,
-                    curve_number,
-                    catchment_area_km2
-                )
+    st.session_state["annual"] = annual
 
-                annual_results = (
-                    calculate_annual_statistics(
-                        runoff_df
-                    )
-                )
+    st.session_state["project_name"] = project_name
 
-                total_rainfall_mm = (
-                    runoff_df["Rainfall_mm"].sum()
-                )
+    st.session_state["latitude"] = latitude
 
-                total_runoff_mm = (
-                    runoff_df["Runoff_mm"].sum()
-                )
+    st.session_state["longitude"] = longitude
 
-                total_runoff_mcm = (
-                    runoff_df["Runoff_MCM"].sum()
-                )
+    st.session_state[
+        "catchment_area_km2"
+    ] = catchment_area_km2
 
-                st.session_state["rainfall_df"] = (
-                    rainfall_df
-                )
+    st.session_state[
+        "curve_number"
+    ] = curve_number
 
-                st.session_state["runoff_df"] = (
-                    runoff_df
-                )
+    st.session_state[
+        "start_date"
+    ] = start_date
 
-                st.session_state["annual_results"] = (
-                    annual_results
-                )
+    st.session_state[
+        "end_date"
+    ] = end_date
 
-                st.session_state["S"] = S
+    st.session_state[
+        "total_runoff_mcm"
+    ] = total_runoff_mcm
 
-                st.session_state["Ia"] = Ia
+    st.session_state[
+        "total_runoff_acre_feet"
+    ] = total_runoff_acre_feet
 
-                st.session_state[
-                    "total_rainfall_mm"
-                ] = total_rainfall_mm
+    st.session_state[
+        "overall_runoff_coefficient"
+    ] = overall_runoff_coefficient
 
-                st.session_state[
-                    "total_runoff_mm"
-                ] = total_runoff_mm
+    # --------------------------------------------------------
+    # SUCCESS MESSAGE
+    # --------------------------------------------------------
 
-                st.session_state[
-                    "total_runoff_mcm"
-                ] = total_runoff_mcm
-
-                st.session_state[
-                    "project_name"
-                ] = project_name
-
-                st.success(
-                    "Water availability calculation completed."
-                )
-
-            except Exception as e:
-
-                st.error(
-                    f"Calculation error: {e}"
-                )
+    st.success(
+        "Water availability calculation completed successfully."
+    )
 
 
-# =========================================================
-# RESULTS
-# =========================================================
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
 
 if "runoff_df" in st.session_state:
 
-    runoff_df = st.session_state["runoff_df"]
+    runoff_df = st.session_state[
+        "runoff_df"
+    ]
 
-    annual_results = (
-        st.session_state["annual_results"]
+    annual = st.session_state[
+        "annual"
+    ]
+
+    project_name = st.session_state[
+        "project_name"
+    ]
+
+    latitude = st.session_state[
+        "latitude"
+    ]
+
+    longitude = st.session_state[
+        "longitude"
+    ]
+
+    catchment_area_km2 = st.session_state[
+        "catchment_area_km2"
+    ]
+
+    curve_number = st.session_state[
+        "curve_number"
+    ]
+
+    start_date = st.session_state[
+        "start_date"
+    ]
+
+    end_date = st.session_state[
+        "end_date"
+    ]
+
+    total_runoff_mcm = st.session_state[
+        "total_runoff_mcm"
+    ]
+
+    total_runoff_acre_feet = st.session_state[
+        "total_runoff_acre_feet"
+    ]
+
+    overall_runoff_coefficient = (
+        st.session_state[
+            "overall_runoff_coefficient"
+        ]
     )
 
-    S = st.session_state["S"]
+    # ========================================================
+    # PROJECT SUMMARY
+    # ========================================================
 
-    Ia = st.session_state["Ia"]
+    st.header("📋 Project Summary")
+
+    summary_col1, summary_col2, summary_col3 = st.columns(3)
+
+    with summary_col1:
+
+        st.write(
+            f"**Project:** {project_name}"
+        )
+
+        st.write(
+            f"**Latitude:** {latitude:.6f}"
+        )
+
+        st.write(
+            f"**Longitude:** {longitude:.6f}"
+        )
+
+    with summary_col2:
+
+        st.write(
+            f"**Catchment Area:** "
+            f"{catchment_area_km2:,.2f} km²"
+        )
+
+        st.write(
+            f"**Curve Number:** "
+            f"{curve_number:.0f}"
+        )
+
+    with summary_col3:
+
+        st.write(
+            f"**Analysis Start:** "
+            f"{start_date}"
+        )
+
+        st.write(
+            f"**Analysis End:** "
+            f"{end_date}"
+        )
+
+    # ========================================================
+    # KEY RESULTS
+    # ========================================================
+
+    st.header("💧 Water Availability Results")
 
     total_rainfall_mm = (
-        st.session_state["total_rainfall_mm"]
+        runoff_df["Rainfall_mm"]
+        .sum()
     )
 
     total_runoff_mm = (
-        st.session_state["total_runoff_mm"]
+        runoff_df["Runoff_mm"]
+        .sum()
     )
 
-    total_runoff_mcm = (
-        st.session_state["total_runoff_mcm"]
+    total_runoff_m3 = (
+        runoff_df["Runoff_m3"]
+        .sum()
     )
 
+    col1, col2, col3, col4, col5 = st.columns(5)
 
-    # =====================================================
-    # METRICS
-    # =====================================================
+    with col1:
 
-    st.subheader("Water Availability Summary")
+        st.metric(
+            "Total Rainfall",
+            f"{total_rainfall_mm:,.1f} mm"
+        )
 
-    col1, col2, col3, col4 = st.columns(4)
+    with col2:
 
-    col1.metric(
-        "Total Rainfall",
-        f"{total_rainfall_mm:,.1f} mm"
-    )
+        st.metric(
+            "Runoff Depth",
+            f"{total_runoff_mm:,.1f} mm"
+        )
 
-    col2.metric(
-        "Runoff Depth",
-        f"{total_runoff_mm:,.1f} mm"
-    )
+    with col3:
 
-    col3.metric(
-        "Estimated Runoff",
-        f"{total_runoff_mcm:,.2f} MCM"
-    )
+        st.metric(
+            "Runoff Volume",
+            f"{total_runoff_mcm:,.2f} MCM"
+        )
 
-    col4.metric(
-        "Curve Number",
-        f"{curve_number:.0f}"
-    )
+    with col4:
 
+        st.metric(
+            "Runoff Volume",
+            f"{total_runoff_acre_feet:,.2f} AF"
+        )
 
-    # =====================================================
+    with col5:
+
+        st.metric(
+            "Runoff Coefficient",
+            f"{overall_runoff_coefficient:.3f}"
+        )
+
+    # ========================================================
     # SCS PARAMETERS
-    # =====================================================
+    # ========================================================
 
-    st.subheader("SCS-CN Parameters")
-
-    col1, col2 = st.columns(2)
-
-    col1.metric(
-        "Potential Maximum Retention (S)",
-        f"{S:.2f} mm"
+    st.subheader(
+        "SCS Curve Number Parameters"
     )
 
-    col2.metric(
-        "Initial Abstraction (Ia)",
-        f"{Ia:.2f} mm"
+    S = (
+        (25400 / curve_number)
+        - 254
     )
 
+    Ia = 0.2 * S
 
-    # =====================================================
+    cn_col1, cn_col2 = st.columns(2)
+
+    with cn_col1:
+
+        st.metric(
+            "Potential Maximum Retention (S)",
+            f"{S:.2f} mm"
+        )
+
+    with cn_col2:
+
+        st.metric(
+            "Initial Abstraction (Ia)",
+            f"{Ia:.2f} mm"
+        )
+
+    # ========================================================
+    # IMPORTANT ENGINEERING NOTE
+    # ========================================================
+
+    st.info(
+        """
+        **Engineering Note:** The calculated runoff represents
+        estimated **direct runoff using the SCS Curve Number method**.
+        It should not automatically be interpreted as the final
+        dependable reservoir yield. A detailed dam water availability
+        assessment may also require consideration of evaporation,
+        seepage, transmission losses, environmental flows,
+        abstractions, reservoir storage, routing and operating rules.
+        """
+    )
+
+    # ========================================================
     # ANNUAL RESULTS
-    # =====================================================
+    # ========================================================
 
-    st.subheader("Annual Water Availability")
+    st.header("📊 Annual Water Availability")
+
+    display_annual = annual.copy()
+
+    display_annual[
+        "Rainfall_mm"
+    ] = display_annual[
+        "Rainfall_mm"
+    ].round(2)
+
+    display_annual[
+        "Runoff_mm"
+    ] = display_annual[
+        "Runoff_mm"
+    ].round(2)
+
+    display_annual[
+        "Runoff_MCM"
+    ] = display_annual[
+        "Runoff_MCM"
+    ].round(3)
+
+    display_annual[
+        "Runoff_AcreFeet"
+    ] = display_annual[
+        "Runoff_AcreFeet"
+    ].round(2)
+
+    display_annual[
+        "Runoff_Coefficient"
+    ] = display_annual[
+        "Runoff_Coefficient"
+    ].round(3)
 
     st.dataframe(
-        annual_results,
-        use_container_width=True
+        display_annual,
+        use_container_width=True,
+        hide_index=True
     )
 
-
-    # =====================================================
+    # ========================================================
     # RAINFALL GRAPH
-    # =====================================================
+    # ========================================================
 
-    st.subheader("Daily Rainfall")
+    st.header("🌧️ Rainfall Analysis")
 
     fig1, ax1 = plt.subplots(
-        figsize=(12, 4)
+        figsize=(12, 5)
     )
 
     ax1.plot(
@@ -554,21 +1035,37 @@ if "runoff_df" in st.session_state:
         runoff_df["Rainfall_mm"]
     )
 
-    ax1.set_xlabel("Date")
-    ax1.set_ylabel("Rainfall (mm)")
-    ax1.grid(True)
+    ax1.set_xlabel(
+        "Date"
+    )
+
+    ax1.set_ylabel(
+        "Daily Rainfall (mm)"
+    )
+
+    ax1.set_title(
+        "Daily Rainfall"
+    )
+
+    ax1.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.tight_layout()
 
     st.pyplot(fig1)
 
+    plt.close(fig1)
 
-    # =====================================================
-    # RUNOFF GRAPH
-    # =====================================================
+    # ========================================================
+    # DAILY RUNOFF GRAPH
+    # ========================================================
 
-    st.subheader("Daily Estimated Runoff")
+    st.header("🌊 Direct Runoff Analysis")
 
     fig2, ax2 = plt.subplots(
-        figsize=(12, 4)
+        figsize=(12, 5)
     )
 
     ax2.plot(
@@ -576,104 +1073,198 @@ if "runoff_df" in st.session_state:
         runoff_df["Runoff_mm"]
     )
 
-    ax2.set_xlabel("Date")
-    ax2.set_ylabel("Runoff (mm)")
-    ax2.grid(True)
+    ax2.set_xlabel(
+        "Date"
+    )
+
+    ax2.set_ylabel(
+        "Daily Runoff (mm)"
+    )
+
+    ax2.set_title(
+        "Daily SCS-CN Direct Runoff"
+    )
+
+    ax2.grid(
+        True,
+        alpha=0.3
+    )
+
+    plt.tight_layout()
 
     st.pyplot(fig2)
 
+    plt.close(fig2)
 
-    # =====================================================
+    # ========================================================
+    # ANNUAL RUNOFF GRAPH
+    # ========================================================
+
+    st.header(
+        "📈 Annual Runoff Volume"
+    )
+
+    fig3, ax3 = plt.subplots(
+        figsize=(12, 5)
+    )
+
+    ax3.bar(
+        annual["Year"].astype(str),
+        annual["Runoff_MCM"]
+    )
+
+    ax3.set_xlabel(
+        "Year"
+    )
+
+    ax3.set_ylabel(
+        "Runoff Volume (MCM)"
+    )
+
+    ax3.set_title(
+        "Annual Direct Runoff"
+    )
+
+    ax3.tick_params(
+        axis="x",
+        rotation=90
+    )
+
+    ax3.grid(
+        axis="y",
+        alpha=0.3
+    )
+
+    plt.tight_layout()
+
+    st.pyplot(fig3)
+
+    plt.close(fig3)
+
+    # ========================================================
     # DOWNLOAD DATA
-    # =====================================================
+    # ========================================================
 
-    st.subheader("Download Results")
+    st.header(
+        "📥 Download Results"
+    )
 
     csv_data = runoff_df.to_csv(
         index=False
     ).encode("utf-8")
 
-    st.download_button(
-        label="Download Daily Results CSV",
-        data=csv_data,
-        file_name="dam_water_availability_daily.csv",
-        mime="text/csv"
-    )
-
-    annual_csv = annual_results.to_csv(
+    annual_csv = annual.to_csv(
         index=False
     ).encode("utf-8")
 
-    st.download_button(
-        label="Download Annual Results CSV",
-        data=annual_csv,
-        file_name="dam_water_availability_annual.csv",
-        mime="text/csv"
+    download_col1, download_col2 = st.columns(2)
+
+    with download_col1:
+
+        st.download_button(
+            label="⬇️ Download Daily Results CSV",
+
+            data=csv_data,
+
+            file_name=(
+                "dam_water_availability_daily.csv"
+            ),
+
+            mime="text/csv",
+
+            use_container_width=True
+        )
+
+    with download_col2:
+
+        st.download_button(
+            label="⬇️ Download Annual Results CSV",
+
+            data=annual_csv,
+
+            file_name=(
+                "dam_water_availability_annual.csv"
+            ),
+
+            mime="text/csv",
+
+            use_container_width=True
+        )
+
+    # ========================================================
+    # AI HYDROLOGICAL INTERPRETATION
+    # ========================================================
+
+    st.header(
+        "🤖 AI Hydrological Interpretation"
     )
 
+    st.write(
+        """
+        Generate an AI-assisted interpretation of the rainfall,
+        runoff and water availability results.
+        """
+    )
 
-    # =====================================================
-    # AI INTERPRETATION
-    # =====================================================
-
-    st.subheader("🤖 AI Hydrological Interpretation")
-
-    if st.button("Generate AI Interpretation"):
+    if st.button(
+        "🧠 Generate AI Interpretation",
+        use_container_width=True
+    ):
 
         with st.spinner(
             "AI is analyzing the hydrological results..."
         ):
 
-            try:
+            interpretation = (
+                generate_ai_interpretation(
 
-                interpretation = (
-                    generate_ai_interpretation(
-                        project_name,
-                        latitude,
-                        longitude,
-                        catchment_area_km2,
-                        curve_number,
-                        start_date,
-                        end_date,
-                        annual_results,
-                        total_runoff_mcm
-                    )
+                    project_name,
+
+                    latitude,
+
+                    longitude,
+
+                    catchment_area_km2,
+
+                    curve_number,
+
+                    start_date,
+
+                    end_date,
+
+                    annual,
+
+                    total_runoff_mcm,
+
+                    total_runoff_acre_feet
                 )
-
-                st.session_state[
-                    "interpretation"
-                ] = interpretation
-
-            except Exception as e:
-
-                st.error(
-                    f"AI error: {e}"
-                )
-
-
-    if "interpretation" in st.session_state:
+            )
 
         st.markdown(
-            st.session_state["interpretation"]
+            interpretation
         )
 
-
-    # =====================================================
+    # ========================================================
     # AI CHATBOT
-    # =====================================================
+    # ========================================================
 
-    st.subheader("💬 Ask the Hydrology AI")
+    st.header(
+        "💬 Ask the Hydrology AI Assistant"
+    )
 
     project_context = f"""
-Project Name: {project_name}
 
-Latitude: {latitude}
-Longitude: {longitude}
+Project Name:
+{project_name}
+
+Location:
+Latitude = {latitude}
+Longitude = {longitude}
 
 Catchment Area:
 {catchment_area_km2} km²
 
-SCS Curve Number:
+Curve Number:
 {curve_number}
 
 Analysis Period:
@@ -682,90 +1273,116 @@ Analysis Period:
 Total Rainfall:
 {total_rainfall_mm:.2f} mm
 
-Total Runoff Depth:
+Total Direct Runoff:
 {total_runoff_mm:.2f} mm
 
-Estimated Direct Runoff:
+Total Direct Runoff:
 {total_runoff_mcm:.3f} MCM
 
-S:
-{S:.2f} mm
+Total Direct Runoff:
+{total_runoff_acre_feet:.2f} Acre-feet
 
-Initial Abstraction:
-{Ia:.2f} mm
+Overall Runoff Coefficient:
+{overall_runoff_coefficient:.3f}
 """
 
+    question = st.text_input(
+        "Enter your hydrological question:",
+        placeholder=(
+            "Example: How does the Curve Number "
+            "affect estimated runoff?"
+        )
+    )
 
-    if "chat_history" not in st.session_state:
+    if st.button(
+        "Ask AI",
+        use_container_width=True
+    ):
 
-        st.session_state["chat_history"] = []
+        if question.strip() == "":
 
+            st.warning(
+                "Please enter a question first."
+            )
 
-    for message in st.session_state["chat_history"]:
+        else:
 
-        with st.chat_message(message["role"]):
+            with st.spinner(
+                "AI is preparing the answer..."
+            ):
+
+                answer = ask_ai_chatbot(
+                    question,
+                    project_context
+                )
 
             st.markdown(
-                message["content"]
+                answer
             )
 
 
-    user_question = st.chat_input(
-        "Ask a question about your dam water availability..."
+# ============================================================
+# INITIAL SCREEN
+# ============================================================
+
+else:
+
+    st.info(
+        """
+        👈 Enter the project information in the sidebar and click
+        **Calculate Water Availability** to start the assessment.
+        """
+    )
+
+    st.markdown(
+        """
+        ### 🔍 Application Workflow
+
+        **1. Project Inputs**
+
+        Enter the dam coordinates, catchment area and SCS Curve Number.
+
+        **2. Rainfall Retrieval**
+
+        Daily rainfall is retrieved automatically from NASA POWER.
+
+        **3. Rainfall–Runoff Modelling**
+
+        The SCS Curve Number method is used to estimate direct runoff.
+
+        **4. Water Availability**
+
+        Runoff is converted into:
+
+        - m³
+        - Million Cubic Metres (MCM)
+        - Acre-feet
+
+        **5. Hydrological Analysis**
+
+        Annual rainfall, runoff and runoff coefficients are calculated.
+
+        **6. Generative AI**
+
+        AI provides hydrological interpretation and answers technical
+        questions.
+
+        **7. Data Export**
+
+        Daily and annual results can be downloaded as CSV files.
+        """
     )
 
 
-    if user_question:
-
-        st.session_state["chat_history"].append(
-            {
-                "role": "user",
-                "content": user_question
-            }
-        )
-
-        with st.chat_message("user"):
-
-            st.markdown(user_question)
-
-
-        with st.chat_message("assistant"):
-
-            with st.spinner("Analyzing..."):
-
-                try:
-
-                    answer = ask_ai_chatbot(
-                        user_question,
-                        project_context
-                    )
-
-                    st.markdown(answer)
-
-                    st.session_state[
-                        "chat_history"
-                    ].append(
-                        {
-                            "role": "assistant",
-                            "content": answer
-                        }
-                    )
-
-                except Exception as e:
-
-                    st.error(
-                        f"AI error: {e}"
-                    )
-
-
-# =========================================================
+# ============================================================
 # FOOTER
-# =========================================================
+# ============================================================
 
-st.divider()
+st.markdown(
+    "---"
+)
 
 st.caption(
     "Dam Water Availability AI | "
-    "NASA POWER + SCS Curve Number + Generative AI"
+    "SCS Curve Number + NASA POWER + Generative AI"
 )
-
